@@ -1,6 +1,6 @@
 # Mark Kevin A. Ong Yiu 
 
-I am an AI & Data Science Manager and solo technical leader specializing in end-to-end system architecture. I bridge rigorous applied mathematics with production-grade full-stack engineering to build autonomous data pipelines, machine learning demand-forecasting models, and enterprise applications from the ground up.
+I am an AI & Data Science Manager with a background in applied mathematics and full-stack engineering. I design and build data pipelines, forecasting models, and internal web applications from scratch—taking projects from initial data modeling all the way to production.
 
 ### 🛠️ Core Engineering Stack
 
@@ -28,15 +28,15 @@ I am an AI & Data Science Manager and solo technical leader specializing in end-
   <img src="https://img.shields.io/badge/PowerBI-F2C811?style=flat-square&logo=powerbi&logoColor=black" alt="PowerBI" />
 </p>
 
-### 🏗️ Production Systems Architected
-*   **Autonomous Global Freight & Container Telemetry Platform:** Architected an end-to-end data pipeline and web application for an international manufacturing enterprise to replace fragmented, manual spreadsheet tracking across cross-border ocean freight corridors.
+### 🏗️ Production Systems
+*   **Automated Container Tracking & Logistics Platform:** Built an end-to-end data pipeline and web app for a manufacturer shipping internationally. The system replaced a manual workflow where staff tracked shipping containers by copy-pasting data between local Excel files, ERP records, and shipping line websites.
     <details>
-    <summary><b>View Architecture & Operational Impact</b></summary>
+    <summary><b>How it works &amp; impact</b></summary>
     <br />
     <ul>
-      <li><b>Automated Multi-Source Ingestion:</b> Eliminated manual copy-pasting across siloed local spreadsheets by building direct data connectors to enterprise ERP systems and external ocean carrier APIs.</li>
-      <li><b>Data Integrity & Validation Guardrails:</b> Engineered automated schema validation, anomaly detection, and state-transition checks at ingestion to prevent downstream data corruption.</li>
-      <li><b>Zero-Touch Reporting Engine:</b> Automated the generation of operational and executive logistics reports—compressing workflows that previously required a full employee workday of manual reconciliation into instantaneous outputs.</li>
+      <li><b>Direct Data Integration:</b> Connected directly to the company's ERP system and shipping carrier APIs to pull container updates automatically into a central database.</li>
+      <li><b>Data Validation:</b> Added automated checks on incoming data to catch formatting errors, missing fields, and conflicting shipment statuses before they cause downstream issues.</li>
+      <li><b>Automated Reporting:</b> Built scheduled reports that replaced what used to take up to a full day of manual spreadsheet work.</li>
     </ul>
     </details>
 
