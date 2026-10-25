@@ -18,10 +18,10 @@ permissions:
 
 jobs:
   update-svg:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Generate live telemetry & forecast SVG
         env:
