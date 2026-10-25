@@ -323,8 +323,15 @@ def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 26) -> Tuple
     return weeks_dates, weeks_counts
 
 
+LANGUAGE_SHORT_NAMES: Dict[str, str] = {
+    "Jupyter Notebook": "Jupyter",
+    "TypeScript": "TS",
+    "JavaScript": "JS",
+}
+
+
 def smooth_svg_path(
-    points: List[Tuple[float, float]], min_y: float = 56.0, max_y: float = 176.0
+    points: List[Tuple[float, float]], min_y: float = 68.0, max_y: float = 180.0
 ) -> str:
     """Create a smooth, monotone-clamped cubic Bezier SVG path through the given points."""
     if not points:
@@ -360,11 +367,11 @@ def render_svg(
     total_year_contribs: int,
 ) -> str:
     width = 800
-    height = 250
+    height = 276
     pad_left = 48
-    pad_right = 32
-    plot_top = 56
-    plot_bottom = 176
+    pad_right = 28
+    plot_top = 68
+    plot_bottom = 180
     plot_w = width - pad_left - pad_right
     plot_h = plot_bottom - plot_top
 
@@ -400,12 +407,12 @@ def render_svg(
     ci_polygon_points = " ".join(ci_poly_coords)
 
     # Build area under observed curve
-    obs_path_d = smooth_svg_path(obs_pts)
+    obs_path_d = smooth_svg_path(obs_pts, min_y=plot_top, max_y=plot_bottom)
     obs_area_d = (
         f"{obs_path_d} L {obs_pts[-1][0]:.1f} {plot_bottom:.1f} "
         f"L {obs_pts[0][0]:.1f} {plot_bottom:.1f} Z"
     )
-    fc_path_d = smooth_svg_path(fc_pts)
+    fc_path_d = smooth_svg_path(fc_pts, min_y=plot_top, max_y=plot_bottom)
 
     nowcast_x, nowcast_y = obs_pts[-1]
 
@@ -417,20 +424,22 @@ def render_svg(
         grid_lines_svg.append(
             f'<line x1="{pad_left}" y1="{yy:.1f}" x2="{width - pad_right}" y2="{yy:.1f}" '
             f'stroke="#21262d" stroke-width="1" />'
-            f'<text x="{pad_left - 8}" y="{yy + 4:.1f}" fill="#6e7681" font-size="10" text-anchor="end">'
+            f'<text x="{pad_left - 10}" y="{yy + 3.5:.1f}" fill="#6e7681" font-size="10" text-anchor="end">'
             f"{int(round(yt))}</text>"
         )
 
-    # X-axis month markers from real dates
+    # X-axis month markers from real dates with strict minimum spacing
     x_labels_svg = []
     seen_months = set()
+    last_label_x = -100.0
     for i, d_str in enumerate(week_dates):
         try:
             dt = datetime.date.fromisoformat(d_str)
             m_key = (dt.year, dt.month)
-            if m_key not in seen_months and i % 4 == 0:
+            xx, _ = to_xy(i, 0)
+            if m_key not in seen_months and (xx - last_label_x) >= 44.0 and xx <= (nowcast_x - 36.0):
                 seen_months.add(m_key)
-                xx, _ = to_xy(i, 0)
+                last_label_x = xx
                 x_labels_svg.append(
                     f'<text x="{xx:.1f}" y="{plot_bottom + 16}" fill="#6e7681" font-size="10" text-anchor="middle">'
                     f'{dt.strftime("%b")}</text>'
@@ -438,10 +447,15 @@ def render_svg(
         except ValueError:
             pass
 
+    x_labels_svg.append(
+        f'<text x="{nowcast_x:.1f}" y="{plot_bottom + 16}" fill="#3fb950" font-size="10" font-weight="bold" text-anchor="middle">'
+        f"t₀</text>"
+    )
+
     fc_end_x, _ = to_xy(total_steps, 0)
     x_labels_svg.append(
         f'<text x="{fc_end_x:.1f}" y="{plot_bottom + 16}" fill="#58a6ff" font-size="10" text-anchor="end">'
-        f"+{n_fc}w Horizon</text>"
+        f"+{n_fc}w</text>"
     )
 
     # Raw weekly observation bars (subtle telemetry impulses)
@@ -453,7 +467,7 @@ def render_svg(
             f'stroke="#238636" stroke-width="3" stroke-opacity="0.35" stroke-linecap="round" />'
         )
 
-    # Compute top languages
+    # Compute top languages (shortened names to guarantee no horizontal overflow)
     if not lang_bytes:
         lang_bytes = {"Python": 60, "TypeScript": 25, "C++": 15}
     total_bytes = max(1, sum(lang_bytes.values()))
@@ -462,10 +476,11 @@ def render_svg(
     for lname, lsize in top_langs:
         pct = (lsize / total_bytes) * 100.0
         color = LANGUAGE_COLORS.get(lname, "#58a6ff")
+        short_name = LANGUAGE_SHORT_NAMES.get(lname, lname)
         lang_spans.append(
-            f'<tspan fill="{color}">●</tspan> <tspan fill="#c9d1d9">{html.escape(lname)} {pct:.0f}%</tspan>'
+            f'<tspan fill="{color}">●</tspan> <tspan fill="#c9d1d9">{html.escape(short_name)} {pct:.0f}%</tspan>'
         )
-    lang_summary_svg = '  <tspan fill="#484f58">•</tspan>  '.join(lang_spans)
+    lang_summary_svg = '   '.join(lang_spans)
 
     updated_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     active_weeks = sum(1 for c in raw_weekly if c > 0)
@@ -495,18 +510,21 @@ def render_svg(
   <!-- Card Background -->
   <rect width="{width}" height="{height}" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1" />
 
-  <!-- Header -->
-  <text x="24" y="30" fill="#f0f6fc" font-size="13" font-weight="bold">QUANTITATIVE ACTIVITY TELEMETRY &amp; L2-REGULARIZED NOWCAST</text>
-  
-  <!-- Legend -->
-  <line x1="455" y1="26" x2="467" y2="26" stroke="#238636" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round" />
-  <text x="473" y="30" fill="#8b949e" font-size="10">Weekly Commits</text>
+  <!-- Row 1: Title & Timestamp -->
+  <text x="24" y="26" fill="#f0f6fc" font-size="12" font-weight="bold">QUANTITATIVE ACTIVITY TELEMETRY &amp; L2-REGULARIZED NOWCAST</text>
+  <text x="{width - 24}" y="26" fill="#6e7681" font-size="10" text-anchor="end">Synced: {updated_utc}</text>
 
-  <circle cx="574" cy="26" r="3.5" fill="#3fb950" />
-  <text x="582" y="30" fill="#8b949e" font-size="10">Filtered Signal</text>
+  <!-- Row 2: Legend Strip (Dedicated row so it never collides with title) -->
+  <line x1="24" y1="43" x2="36" y2="43" stroke="#238636" stroke-width="3" stroke-opacity="0.8" stroke-linecap="round" />
+  <text x="42" y="47" fill="#8b949e" font-size="10">Weekly Commits</text>
 
-  <circle cx="684" cy="26" r="3.5" fill="#58a6ff" />
-  <text x="692" y="30" fill="#8b949e" font-size="10">95% CI Forecast</text>
+  <circle cx="156" cy="43" r="3.5" fill="#3fb950" />
+  <text x="164" y="47" fill="#8b949e" font-size="10">EWMA Latent Signal</text>
+
+  <circle cx="304" cy="43" r="3.5" fill="#58a6ff" />
+  <text x="312" y="47" fill="#8b949e" font-size="10">Ridge AR-DFM Forecast (95% CI)</text>
+
+  <line x1="24" y1="55" x2="{width - 24}" y2="55" stroke="#21262d" stroke-width="1" />
 
   <!-- Grid Lines -->
   {"".join(grid_lines_svg)}
@@ -523,18 +541,21 @@ def render_svg(
   <path d="{fc_path_d}" fill="none" stroke="#58a6ff" stroke-width="2.2" stroke-dasharray="5,4" />
 
   <!-- Nowcast Vertical Horizon Line & Animated Marker -->
-  <line x1="{nowcast_x:.1f}" y1="{plot_top - 6}" x2="{nowcast_x:.1f}" y2="{plot_bottom}" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3" />
+  <line x1="{nowcast_x:.1f}" y1="{plot_top - 4}" x2="{nowcast_x:.1f}" y2="{plot_bottom}" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3" />
   <circle cx="{nowcast_x:.1f}" cy="{nowcast_y:.1f}" r="4" fill="none" stroke="#3fb950" stroke-width="2" class="pulse-ring" />
   <circle cx="{nowcast_x:.1f}" cy="{nowcast_y:.1f}" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.2" />
-  <text x="{nowcast_x + 6:.1f}" y="{plot_top + 8}" fill="#8b949e" font-size="10">t₀ (Nowcast)</text>
 
   <!-- X-Axis Labels -->
   {"".join(x_labels_svg)}
 
-  <!-- Bottom Telemetry Bar -->
-  <rect x="20" y="202" width="{width - 40}" height="32" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
-  <text x="32" y="222" font-size="11">{lang_summary_svg}</text>
-  <text x="{width - 32}" y="222" fill="#8b949e" font-size="10" text-anchor="end">52w: <tspan fill="#3fb950" font-weight="bold">{total_year_contribs}</tspan> contribs ({active_weeks}/{len(raw_weekly)}w active) • RMSE={rmse:.2f} • {updated_utc}</text>
+  <!-- Bottom Telemetry Split Cards (Two independent boxes prevent any horizontal text collision) -->
+  <rect x="20" y="210" width="430" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
+  <text x="32" y="227" fill="#6e7681" font-size="9" font-weight="bold">REPOSITORY LANGUAGE DISTRIBUTION</text>
+  <text x="32" y="246" font-size="11">{lang_summary_svg}</text>
+
+  <rect x="462" y="210" width="318" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
+  <text x="474" y="227" fill="#6e7681" font-size="9" font-weight="bold">52-WEEK TELEMETRY &amp; MODEL DIAGNOSTICS</text>
+  <text x="474" y="246" fill="#c9d1d9" font-size="11"><tspan fill="#3fb950" font-weight="bold">{total_year_contribs}</tspan> contribs  •  {active_weeks}/{len(raw_weekly)}w active  •  RMSE {rmse:.2f}</text>
 </svg>
 """
 
