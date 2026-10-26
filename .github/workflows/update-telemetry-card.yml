@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Generate live telemetry & forecast SVG
         env:
@@ -46,5 +48,5 @@ jobs:
           else
             git commit -m "chore(telemetry): update live contribution signal & forecast SVG [skip ci]"
             git pull --rebase origin "${{ github.ref_name }}"
-            git push origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
           fi
