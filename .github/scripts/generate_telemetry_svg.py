@@ -432,12 +432,21 @@ def render_svg(
     upper_ci = [m + 1.96 * s for m, s in zip(forecast_mean, forecast_std)]
     lower_ci = [max(0.0, m - 1.96 * s) for m, s in zip(forecast_mean, forecast_std)]
 
-    max_val = max(
+    raw_ceiling = max(
         max(raw_weekly, default=1.0),
         max(latent_signal, default=1.0),
         max(upper_ci, default=1.0),
         4.0,
-    ) * 1.15
+    ) * 1.12
+
+    # Calibrate Y-axis maximum to clean, readable round numbers
+    def nice_ceiling(val: float) -> float:
+        for step in [10.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 150.0, 200.0]:
+            if val <= step:
+                return step
+        return math.ceil(val / 50.0) * 50.0
+
+    max_val = nice_ceiling(raw_ceiling)
 
     def to_xy(step_idx: int, val: float) -> Tuple[float, float]:
         x = pad_left + (step_idx / max(1, total_steps)) * plot_w
@@ -474,7 +483,7 @@ def render_svg(
         grid_lines_svg.append(
             f'<line x1="{pad_left}" y1="{yy:.1f}" x2="{width - pad_right}" y2="{yy:.1f}" '
             f'stroke="#21262d" stroke-width="1" />'
-            f'<text x="{pad_left - 10}" y="{yy + 3.5:.1f}" fill="#6e7681" font-size="10" text-anchor="end">'
+            f'<text x="{pad_left - 10}" y="{yy + 3.5:.1f}" fill="#8b949e" font-size="10" text-anchor="end">'
             f"{int(round(yt))}</text>"
         )
 
@@ -491,7 +500,7 @@ def render_svg(
                 seen_months.add(m_key)
                 last_label_x = xx
                 x_labels_svg.append(
-                    f'<text x="{xx:.1f}" y="{plot_bottom + 16}" fill="#6e7681" font-size="10" text-anchor="middle">'
+                    f'<text x="{xx:.1f}" y="{plot_bottom + 16}" fill="#8b949e" font-size="10" text-anchor="middle">'
                     f'{dt.strftime("%b")}</text>'
                 )
         except ValueError:
