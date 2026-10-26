@@ -107,30 +107,34 @@ def fetch_via_graphql(username: str, token: str, use_viewer: bool = False) -> Tu
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    if "errors" in data and not data.get("data", {}).get("target"):
-        raise RuntimeError(f"GraphQL error: {data['errors']}")
+    user_data = (data.get("data") or {}).get("target")
+    if not user_data:
+        raise RuntimeError(f"GraphQL error or empty target: {data.get('errors')}")
 
-    user_data = data["data"]["target"]
-    cal = user_data["contributionsCollection"]["contributionCalendar"]
-    total_contributions = int(cal["totalContributions"])
+    cal = user_data.get("contributionsCollection", {}).get("contributionCalendar", {})
+    total_contributions = int(cal.get("totalContributions", 0))
 
     daily: List[Tuple[str, int]] = []
-    for week in cal["weeks"]:
-        for day in week["contributionDays"]:
-            daily.append((day["date"], int(day["contributionCount"])))
+    for week in cal.get("weeks", []):
+        for day in week.get("contributionDays", []):
+            daily.append((day["date"], int(day.get("contributionCount", 0))))
 
     lang_bytes: Dict[str, int] = {}
-    for repo in user_data["repositories"]["nodes"]:
-        if repo["name"].lower() == username.lower():
+    repo_nodes = (user_data.get("repositories") or {}).get("nodes") or []
+    for repo in repo_nodes:
+        if not repo or repo.get("name", "").lower() == username.lower():
             continue
-        for edge in repo.get("languages", {}).get("edges", []):
-            lname = edge["node"]["name"]
-            lang_bytes[lname] = lang_bytes.get(lname, 0) + int(edge["size"])
+        lang_obj = repo.get("languages") or {}
+        for edge in lang_obj.get("edges") or []:
+            node = edge.get("node") or {}
+            lname = node.get("name")
+            if lname:
+                lang_bytes[lname] = lang_bytes.get(lname, 0) + int(edge.get("size", 0))
 
     return daily, lang_bytes, total_contributions
 
 
-def fetch_via_public(username: str) -> Tuple[List[Tuple[str, int]], Dict[str, int], int]:
+def fetch_via_public(username: str, token: Optional[str] = None) -> Tuple[List[Tuple[str, int]], Dict[str, int], int]:
     """Fallback fetcher using public GitHub profile contributions HTML and REST API."""
     daily: List[Tuple[str, int]] = []
     total_contributions = 0
@@ -154,19 +158,28 @@ def fetch_via_public(username: str) -> Tuple[List[Tuple[str, int]], Dict[str, in
     except Exception:
         pass
 
-    if not daily:
-        raw_json = http_get(f"https://github-contributions-api.jogruber.de/v4/{username}?y=last")
-        parsed = json.loads(raw_json)
-        for item in parsed.get("contributions", []):
-            c = int(item.get("count", 0))
-            daily.append((item["date"], c))
-        total_contributions = sum(c for _, c in daily)
+    if not daily or total_contributions == 0:
+        daily = []
+        total_contributions = 0
+        try:
+            raw_json = http_get(f"https://github-contributions-api.jogruber.de/v4/{username}?y=last")
+            parsed = json.loads(raw_json)
+            for item in parsed.get("contributions", []):
+                c = int(item.get("count", 0))
+                daily.append((item["date"], c))
+            total_contributions = sum(c for _, c in daily)
+        except Exception as exc:
+            print(f"Fallback contributions API fetch failed: {exc}")
 
     # 2. Fetch public repositories for language breakdown (normalized per repo)
     lang_bytes: Dict[str, int] = {}
     try:
+        rest_headers = {"Authorization": f"Bearer {token}"} if token else None
         repos_json = json.loads(
-            http_get(f"https://api.github.com/users/{username}/repos?per_page=100&type=owner")
+            http_get(
+                f"https://api.github.com/users/{username}/repos?per_page=100&type=owner",
+                headers=rest_headers,
+            )
         )
         for repo in repos_json:
             if repo.get("fork") or repo.get("name", "").lower() == username.lower():
@@ -204,16 +217,16 @@ def solve_linear_system(A: List[List[float]], b: List[float]) -> List[float]:
 
 
 def fit_regularized_dfm_ar(
-    series: List[float], horizon: int = 8, ridge_lambda: float = 1.5
+    series: List[float], week_dates: Optional[List[str]] = None, horizon: int = 8, ridge_lambda: float = 1.5
 ) -> Tuple[List[float], List[float], List[float], float]:
     """
-    Fits an L2-Regularized Autoregressive + Dynamic Factor Model on weekly series y_t.
+    Fits an L2-Regularized Autoregressive model with Harmonic Seasonality on weekly series y_t.
     Features at time t:
       - Intercept (1.0)
       - Lag 1: y_{t-1}
       - Lag 2: y_{t-2}
       - Local Momentum Factor: mean(y_{t-4 : t})
-      - Annual/Quarterly Harmonic Factors: sin(2*pi*t/13), cos(2*pi*t/13)
+      - Calendar Harmonic Factors: sin(2*pi*w/13), cos(2*pi*w/13) (anchored to ISO calendar week)
     Returns (in_sample_fitted, forecast_mean, forecast_std, rmse).
     """
     n = len(series)
@@ -228,6 +241,17 @@ def fit_regularized_dfm_ar(
     for val in series[1:]:
         latent.append(alpha * val + (1.0 - alpha) * latent[-1])
 
+    # Anchor harmonic factors to calendar ISO week if dates are provided
+    iso_weeks: List[Optional[int]] = []
+    if week_dates and len(week_dates) == n:
+        for d in week_dates:
+            try:
+                iso_weeks.append(datetime.date.fromisoformat(d).isocalendar()[1])
+            except ValueError:
+                iso_weeks.append(None)
+    else:
+        iso_weeks = [None] * n
+
     lags = 4
     X: List[List[float]] = []
     y_target: List[float] = []
@@ -237,8 +261,9 @@ def fit_regularized_dfm_ar(
         f_lag1 = latent[t - 1]
         f_lag2 = latent[t - 2]
         f_mom = sum(latent[t - lags : t]) / float(lags)
-        f_sin = math.sin(2.0 * math.pi * t / 13.0)
-        f_cos = math.cos(2.0 * math.pi * t / 13.0)
+        w_idx = iso_weeks[t] if iso_weeks[t] is not None else t
+        f_sin = math.sin(2.0 * math.pi * w_idx / 13.0)
+        f_cos = math.cos(2.0 * math.pi * w_idx / 13.0)
         X.append([f_intercept, f_lag1, f_lag2, f_mom, f_sin, f_cos])
         y_target.append(latent[t])
 
@@ -273,34 +298,48 @@ def fit_regularized_dfm_ar(
     history = latent[:]
     forecast_mean: List[float] = []
     forecast_std: List[float] = []
+
+    mean_baseline = sum(latent) / max(1, len(latent))
+    max_observed = max(max(series, default=1.0), 1.0)
+    ceiling = max(max_observed * 1.5, 10.0)
+
     phi1 = beta[1] + beta[3] / float(lags)
+    # Stationarity dampener ensures multi-step projections do not explode exponentially
+    damp_factor = min(max(phi1, 0.35), 0.85)
     psi_sum_sq = 1.0
 
+    last_iso = iso_weeks[-1]
     for h in range(1, horizon + 1):
-        t_idx = n - 1 + h
+        if last_iso is not None:
+            w_idx = (last_iso + h - 1) % 52 + 1
+        else:
+            w_idx = n - 1 + h
         row = [
             1.0,
             history[-1],
             history[-2],
             sum(history[-lags:]) / float(lags),
-            math.sin(2.0 * math.pi * t_idx / 13.0),
-            math.cos(2.0 * math.pi * t_idx / 13.0),
+            math.sin(2.0 * math.pi * w_idx / 13.0),
+            math.cos(2.0 * math.pi * w_idx / 13.0),
         ]
-        pred = max(0.2, sum(b * x for b, x in zip(beta, row)))
+        raw_pred = sum(b * x for b, x in zip(beta, row))
+        # Revert multi-step forecast smoothly towards baseline mean to preserve stationarity
+        damped_pred = mean_baseline + (raw_pred - mean_baseline) * (damp_factor ** (h * 0.75))
+        pred = min(max(0.0, damped_pred), ceiling)
         forecast_mean.append(pred)
         history.append(pred)
 
         if h > 1:
-            psi_sum_sq += (min(max(phi1, 0.25), 0.85)) ** (2 * (h - 1))
+            psi_sum_sq += damp_factor ** (2 * (h - 1))
         forecast_std.append(base_std * math.sqrt(psi_sum_sq))
 
     return latent, forecast_mean, forecast_std, rmse
 
 
-def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 26) -> Tuple[List[str], List[float]]:
+def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 52) -> Tuple[List[str], List[float]]:
     """Aggregate daily (date, count) into the most recent `num_weeks` 7-day buckets."""
+    today = datetime.date.today()
     if not daily:
-        today = datetime.date.today()
         dates = [(today - datetime.timedelta(weeks=num_weeks - 1 - i)).isoformat() for i in range(num_weeks)]
         return dates, [0.0] * num_weeks
 
@@ -320,6 +359,17 @@ def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 26) -> Tuple
 
     weeks_dates.reverse()
     weeks_counts.reverse()
+
+    # Prepend zero-padded weeks if the historical data has fewer than num_weeks
+    while len(weeks_counts) < num_weeks:
+        try:
+            earliest_dt = datetime.date.fromisoformat(weeks_dates[0])
+            padded_dt = earliest_dt - datetime.timedelta(days=7)
+        except (IndexError, ValueError):
+            padded_dt = today - datetime.timedelta(weeks=num_weeks - len(weeks_counts))
+        weeks_dates.insert(0, padded_dt.isoformat())
+        weeks_counts.insert(0, 0.0)
+
     return weeks_dates, weeks_counts
 
 
@@ -495,16 +545,6 @@ def render_svg(
       <stop offset="0%" stop-color="#58a6ff" stop-opacity="0.30" />
       <stop offset="100%" stop-color="#58a6ff" stop-opacity="0.04" />
     </linearGradient>
-    <style>
-      .pulse-ring {{
-        animation: pulse 2.4s infinite ease-out;
-        transform-origin: {nowcast_x:.1f}px {nowcast_y:.1f}px;
-      }}
-      @keyframes pulse {{
-        0% {{ r: 4px; opacity: 0.9; }}
-        100% {{ r: 14px; opacity: 0; }}
-      }}
-    </style>
   </defs>
 
   <!-- Card Background -->
@@ -512,17 +552,17 @@ def render_svg(
 
   <!-- Row 1: Title & Timestamp -->
   <text x="24" y="26" fill="#f0f6fc" font-size="12" font-weight="bold">QUANTITATIVE ACTIVITY TELEMETRY &amp; L2-REGULARIZED NOWCAST</text>
-  <text x="{width - 24}" y="26" fill="#6e7681" font-size="10" text-anchor="end">Synced: {updated_utc}</text>
+  <text x="{width - 24}" y="26" fill="#8b949e" font-size="10" text-anchor="end">Synced: {updated_utc}</text>
 
   <!-- Row 2: Legend Strip (Dedicated row so it never collides with title) -->
   <line x1="24" y1="43" x2="36" y2="43" stroke="#238636" stroke-width="3" stroke-opacity="0.8" stroke-linecap="round" />
-  <text x="42" y="47" fill="#8b949e" font-size="10">Weekly Commits</text>
+  <text x="42" y="47" fill="#8b949e" font-size="10">Weekly Contributions</text>
 
-  <circle cx="156" cy="43" r="3.5" fill="#3fb950" />
-  <text x="164" y="47" fill="#8b949e" font-size="10">EWMA Latent Signal</text>
+  <circle cx="178" cy="43" r="3.5" fill="#3fb950" />
+  <text x="186" y="47" fill="#8b949e" font-size="10">EWMA Latent Signal</text>
 
-  <circle cx="304" cy="43" r="3.5" fill="#58a6ff" />
-  <text x="312" y="47" fill="#8b949e" font-size="10">Ridge AR-DFM Forecast (95% CI)</text>
+  <circle cx="326" cy="43" r="3.5" fill="#58a6ff" />
+  <text x="334" y="47" fill="#8b949e" font-size="10">Ridge AR Forecast (95% CI)</text>
 
   <line x1="24" y1="55" x2="{width - 24}" y2="55" stroke="#21262d" stroke-width="1" />
 
@@ -542,20 +582,23 @@ def render_svg(
 
   <!-- Nowcast Vertical Horizon Line & Animated Marker -->
   <line x1="{nowcast_x:.1f}" y1="{plot_top - 4}" x2="{nowcast_x:.1f}" y2="{plot_bottom}" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3" />
-  <circle cx="{nowcast_x:.1f}" cy="{nowcast_y:.1f}" r="4" fill="none" stroke="#3fb950" stroke-width="2" class="pulse-ring" />
+  <circle cx="{nowcast_x:.1f}" cy="{nowcast_y:.1f}" r="4" fill="none" stroke="#3fb950" stroke-width="2">
+    <animate attributeName="r" values="4;14" dur="2.4s" repeatCount="indefinite" />
+    <animate attributeName="opacity" values="0.9;0" dur="2.4s" repeatCount="indefinite" />
+  </circle>
   <circle cx="{nowcast_x:.1f}" cy="{nowcast_y:.1f}" r="4" fill="#0d1117" stroke="#3fb950" stroke-width="2.2" />
 
   <!-- X-Axis Labels -->
   {"".join(x_labels_svg)}
 
-  <!-- Bottom Telemetry Split Cards (Two independent boxes prevent any horizontal text collision) -->
-  <rect x="20" y="210" width="430" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
-  <text x="32" y="227" fill="#6e7681" font-size="9" font-weight="bold">REPOSITORY LANGUAGE DISTRIBUTION</text>
-  <text x="32" y="246" font-size="11">{lang_summary_svg}</text>
+  <!-- Bottom Telemetry Split Cards (Balanced widths prevent horizontal text clipping) -->
+  <rect x="20" y="210" width="370" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
+  <text x="32" y="227" fill="#8b949e" font-size="9" font-weight="bold">REPOSITORY LANGUAGE DISTRIBUTION</text>
+  <text x="32" y="246" font-size="11" xml:space="preserve">{lang_summary_svg}</text>
 
-  <rect x="462" y="210" width="318" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
-  <text x="474" y="227" fill="#6e7681" font-size="9" font-weight="bold">52-WEEK TELEMETRY &amp; MODEL DIAGNOSTICS</text>
-  <text x="474" y="246" fill="#c9d1d9" font-size="11"><tspan fill="#3fb950" font-weight="bold">{total_year_contribs}</tspan> contribs  •  {active_weeks}/{len(raw_weekly)}w active  •  RMSE {rmse:.2f}</text>
+  <rect x="402" y="210" width="378" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
+  <text x="414" y="227" fill="#8b949e" font-size="9" font-weight="bold">52-WEEK TELEMETRY &amp; MODEL DIAGNOSTICS</text>
+  <text x="414" y="246" fill="#c9d1d9" font-size="11"><tspan fill="#3fb950" font-weight="bold">{total_year_contribs}</tspan> contribs  •  {active_weeks}/{len(raw_weekly)}w active  •  RMSE {rmse:.2f}</text>
 </svg>
 """
 
@@ -577,12 +620,12 @@ def main() -> None:
             print(f"GraphQL fetch failed ({exc}), falling back to public endpoints...")
 
     if not daily:
-        daily, lang_bytes, total_contribs = fetch_via_public(USERNAME)
+        daily, lang_bytes, total_contribs = fetch_via_public(USERNAME, token=token)
         print(f"Fetched live public telemetry for @{USERNAME} ({len(daily)} days, {total_contribs} total contributions).")
 
     week_dates, raw_weekly = aggregate_weekly(daily, num_weeks=52)
     latent_signal, forecast_mean, forecast_std, rmse = fit_regularized_dfm_ar(
-        raw_weekly, horizon=8, ridge_lambda=1.5
+        raw_weekly, week_dates=week_dates, horizon=8, ridge_lambda=1.5
     )
 
     svg_content = render_svg(
@@ -597,6 +640,17 @@ def main() -> None:
     )
 
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    if os.path.exists(OUTPUT_PATH):
+        try:
+            with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+                existing_svg = f.read()
+            normalize_ts = lambda s: re.sub(r"Synced: [^<]+", "Synced: STATIC", s)
+            if normalize_ts(existing_svg) == normalize_ts(svg_content):
+                print("Telemetry data unchanged; skipping file write to prevent no-op commits.")
+                return
+        except Exception:
+            pass
+
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(svg_content)
     print(f"Wrote live SVG card to {OUTPUT_PATH}")

@@ -13,12 +13,17 @@ on:
       - ".github/scripts/generate_telemetry_svg.py"
       - ".github/workflows/update-telemetry-card.yml"
 
+concurrency:
+  group: telemetry-svg-update
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   update-svg:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -31,6 +36,7 @@ jobs:
         run: python3 .github/scripts/generate_telemetry_svg.py
 
       - name: Commit and push updated SVG
+        if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -39,5 +45,6 @@ jobs:
             echo "No telemetry changes to commit."
           else
             git commit -m "chore(telemetry): update live contribution signal & forecast SVG [skip ci]"
-            git push
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "${{ github.ref_name }}"
           fi
