@@ -5,8 +5,7 @@ Generates a live Quantitative Forecasting & Contribution Telemetry SVG card
 
 Data Pipeline:
 1. Extracts 52-week daily contribution counts and repository language bytes
-   via GitHub GraphQL API (when GITHUB_TOKEN / METRICS_TOKEN is set) or
-   public GitHub endpoints.
+   via GitHub GraphQL API.
 2. Aggregates weekly contribution series y_t and fits an L2-Regularized
    Autoregressive & Harmonic Dynamic Factor Model (Ridge AR-DFM):
        beta_hat = (X^T X + lambda * I)^(-1) X^T y
@@ -21,7 +20,7 @@ import json
 import math
 import os
 import re
-import urllib.error
+import sys
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
@@ -45,17 +44,11 @@ LANGUAGE_COLORS: Dict[str, str] = {
     "Go": "#00ADD8",
 }
 
-
-def http_get(url: str, headers: Optional[Dict[str, str]] = None) -> str:
-    req_headers = {
-        "User-Agent": "ongyiumark-telemetry-generator/1.0",
-        "Accept": "application/vnd.github+json",
-    }
-    if headers:
-        req_headers.update(headers)
-    req = urllib.request.Request(url, headers=req_headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+LANGUAGE_SHORT_NAMES: Dict[str, str] = {
+    "Jupyter Notebook": "Jupyter",
+    "TypeScript": "TS",
+    "JavaScript": "JS",
+}
 
 
 def fetch_via_graphql(username: str, token: str, use_viewer: bool = False) -> Tuple[List[Tuple[str, int]], Dict[str, int], int]:
@@ -134,68 +127,6 @@ def fetch_via_graphql(username: str, token: str, use_viewer: bool = False) -> Tu
     return daily, lang_bytes, total_contributions
 
 
-def fetch_via_public(username: str, token: Optional[str] = None) -> Tuple[List[Tuple[str, int]], Dict[str, int], int]:
-    """Fallback fetcher using public GitHub profile contributions HTML and REST API."""
-    daily: List[Tuple[str, int]] = []
-    total_contributions = 0
-
-    # 1. Fetch live from github.com/users/{username}/contributions first (reflects profile settings immediately)
-    try:
-        html_text = http_get(
-            f"https://github.com/users/{username}/contributions",
-            headers={"Accept": "text/html"},
-        )
-        date_matches = re.findall(r'data-date="(\d{4}-\d{2}-\d{2})"[^>]*id="([^"]+)"', html_text)
-        tooltip_map: Dict[str, int] = {}
-        for tid, text in re.findall(r'for="([^"]+)"[^>]*>([^<]+)</tool-tip>', html_text):
-            m = re.search(r"(\d+)\s+contribution", text)
-            tooltip_map[tid] = int(m.group(1)) if m else 0
-        for d_str, tid in date_matches:
-            c = tooltip_map.get(tid, 0)
-            daily.append((d_str, c))
-        daily.sort(key=lambda x: x[0])
-        total_contributions = sum(c for _, c in daily)
-    except Exception:
-        pass
-
-    if not daily or total_contributions == 0:
-        daily = []
-        total_contributions = 0
-        try:
-            raw_json = http_get(f"https://github-contributions-api.jogruber.de/v4/{username}?y=last")
-            parsed = json.loads(raw_json)
-            for item in parsed.get("contributions", []):
-                c = int(item.get("count", 0))
-                daily.append((item["date"], c))
-            total_contributions = sum(c for _, c in daily)
-        except Exception as exc:
-            print(f"Fallback contributions API fetch failed: {exc}")
-
-    # 2. Fetch public repositories for language breakdown (normalized per repo)
-    lang_bytes: Dict[str, int] = {}
-    try:
-        rest_headers = {"Authorization": f"Bearer {token}"} if token else None
-        repos_json = json.loads(
-            http_get(
-                f"https://api.github.com/users/{username}/repos?per_page=100&type=owner",
-                headers=rest_headers,
-            )
-        )
-        for repo in repos_json:
-            if repo.get("fork") or repo.get("name", "").lower() == username.lower():
-                continue
-            lang = repo.get("language")
-            if lang:
-                # Weight by log2(size_kb + 2) so one repo with large data assets doesn't dominate
-                size_kb = max(int(repo.get("size", 1)), 1)
-                weight = int(round(math.log2(size_kb + 2) * 1000))
-                lang_bytes[lang] = lang_bytes.get(lang, 0) + weight
-    except Exception:
-        pass
-
-    return daily, lang_bytes, total_contributions
-
-
 def solve_linear_system(A: List[List[float]], b: List[float]) -> List[float]:
     """Solve A x = b via Gaussian elimination with partial pivoting."""
     n = len(b)
@@ -205,7 +136,7 @@ def solve_linear_system(A: List[List[float]], b: List[float]) -> List[float]:
         M[col], M[pivot] = M[pivot], M[col]
         denom = M[col][col]
         if abs(denom) < 1e-12:
-            denom = 1e-12
+            denom = 1e-12 if denom >= 0 else -1e-12
         for j in range(col, n + 1):
             M[col][j] /= denom
         for r in range(n):
@@ -227,7 +158,7 @@ def fit_regularized_dfm_ar(
       - Lag 2: y_{t-2}
       - Local Momentum Factor: mean(y_{t-4 : t})
       - Calendar Harmonic Factors: sin(2*pi*w/13), cos(2*pi*w/13) (anchored to ISO calendar week)
-    Returns (in_sample_fitted, forecast_mean, forecast_std, rmse).
+    Returns (latent_signal, forecast_mean, forecast_std, rmse).
     """
     n = len(series)
     if n < 8:
@@ -268,25 +199,46 @@ def fit_regularized_dfm_ar(
         y_target.append(latent[t])
 
     p = len(X[0])
-    # Compute X^T X + lambda * I (do not regularize intercept at index 0)
-    XtX = [[0.0] * p for _ in range(p)]
-    Xty = [0.0] * p
-    for row, y_val in zip(X, y_target):
-        for i in range(p):
-            Xty[i] += row[i] * y_val
-            for j in range(p):
-                XtX[i][j] += row[i] * row[j]
-    for i in range(1, p):
-        XtX[i][i] += ridge_lambda
+    n_samples = len(X)
 
-    beta = solve_linear_system(XtX, Xty)
+    # Standardize non-intercept features (columns 1..p-1) to unit variance
+    # so L2 shrinkage is scale-invariant across lags and harmonic factors.
+    means = [0.0] * p
+    stds = [1.0] * p
+    for j in range(1, p):
+        col_vals = [X[i][j] for i in range(n_samples)]
+        means[j] = sum(col_vals) / n_samples
+        var = sum((v - means[j]) ** 2 for v in col_vals) / max(1, n_samples - 1)
+        stds[j] = math.sqrt(var) if var > 1e-9 else 1.0
+
+    Z: List[List[float]] = []
+    for row in X:
+        z_row = [1.0] + [(row[j] - means[j]) / stds[j] for j in range(1, p)]
+        Z.append(z_row)
+
+    # Solve Ridge on standardized design matrix Z: (Z^T Z + lambda * I) beta_std = Z^T y
+    ZtZ = [[0.0] * p for _ in range(p)]
+    Zty = [0.0] * p
+    for z_row, y_val in zip(Z, y_target):
+        for i in range(p):
+            Zty[i] += z_row[i] * y_val
+            for j in range(p):
+                ZtZ[i][j] += z_row[i] * z_row[j]
+    for i in range(1, p):
+        ZtZ[i][i] += ridge_lambda
+
+    beta_std = solve_linear_system(ZtZ, Zty)
+
+    # Transform coefficients back to original feature scale
+    beta = [0.0] * p
+    for j in range(1, p):
+        beta[j] = beta_std[j] / stds[j]
+    beta[0] = beta_std[0] - sum(beta_std[j] * means[j] / stds[j] for j in range(1, p))
 
     # In-sample predictions and residual variance
-    fitted = latent[:lags]
     sq_errors: List[float] = []
     for row, y_val in zip(X, y_target):
         pred = max(0.0, sum(b * x for b, x in zip(beta, row)))
-        fitted.append(pred)
         sq_errors.append((y_val - pred) ** 2)
 
     dof = max(1, len(sq_errors) - p)
@@ -299,21 +251,40 @@ def fit_regularized_dfm_ar(
     forecast_mean: List[float] = []
     forecast_std: List[float] = []
 
-    mean_baseline = sum(latent) / max(1, len(latent))
+    # Autoregressive persistence across lag 1, lag 2, and local momentum
+    phi = beta[1] + beta[2] + beta[3]
+    damp_factor = min(max(phi, 0.40), 0.88)
+
+    # In industry time-series nowcasting, the long-run baseline reflects either the
+    # model-implied steady-state equilibrium or the active-regime level, avoiding
+    # historical drag from dormant zero-weeks while preventing sprint locking.
+    active_latent = [v for v in latent if v > 0.1]
+    active_mean = sum(active_latent) / max(1, len(active_latent)) if active_latent else 0.0
+
+    denom = 1.0 - phi
+    if denom > 0.08 and beta[0] > 0.0:
+        ar_implied_mean = beta[0] / denom
+        mean_baseline = min(max(ar_implied_mean, active_mean * 0.4), max(active_mean * 1.4, latent[-1]))
+    else:
+        mean_baseline = sum(latent[-12:]) / min(12, len(latent))
+
     max_observed = max(max(series, default=1.0), 1.0)
     ceiling = max(max_observed * 1.5, 10.0)
-
-    phi1 = beta[1] + beta[3] / float(lags)
-    # Stationarity dampener ensures multi-step projections do not explode exponentially
-    damp_factor = min(max(phi1, 0.35), 0.85)
     psi_sum_sq = 1.0
 
     last_iso = iso_weeks[-1]
     for h in range(1, horizon + 1):
-        if last_iso is not None:
+        if week_dates and len(week_dates) == n:
+            try:
+                last_dt = datetime.date.fromisoformat(week_dates[-1])
+                w_idx = (last_dt + datetime.timedelta(weeks=h)).isocalendar()[1]
+            except ValueError:
+                w_idx = ((last_iso + h - 1) % 52 + 1) if last_iso is not None else (n - 1 + h)
+        elif last_iso is not None:
             w_idx = (last_iso + h - 1) % 52 + 1
         else:
             w_idx = n - 1 + h
+
         row = [
             1.0,
             history[-1],
@@ -338,7 +309,7 @@ def fit_regularized_dfm_ar(
 
 def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 52) -> Tuple[List[str], List[float]]:
     """Aggregate daily (date, count) into the most recent `num_weeks` 7-day buckets."""
-    today = datetime.date.today()
+    today = datetime.datetime.now(datetime.timezone.utc).date()
     if not daily:
         dates = [(today - datetime.timedelta(weeks=num_weeks - 1 - i)).isoformat() for i in range(num_weeks)]
         return dates, [0.0] * num_weeks
@@ -373,13 +344,6 @@ def aggregate_weekly(daily: List[Tuple[str, int]], num_weeks: int = 52) -> Tuple
     return weeks_dates, weeks_counts
 
 
-LANGUAGE_SHORT_NAMES: Dict[str, str] = {
-    "Jupyter Notebook": "Jupyter",
-    "TypeScript": "TS",
-    "JavaScript": "JS",
-}
-
-
 def smooth_svg_path(
     points: List[Tuple[float, float]], min_y: float = 68.0, max_y: float = 180.0
 ) -> str:
@@ -404,6 +368,22 @@ def smooth_svg_path(
 
         path.append(f"C {cp1x:.1f} {cp1y:.1f}, {cp2x:.1f} {cp2y:.1f}, {p2[0]:.1f} {p2[1]:.1f}")
     return " ".join(path)
+
+
+def smooth_ci_fan(
+    top_pts: List[Tuple[float, float]],
+    bot_pts: List[Tuple[float, float]],
+    min_y: float = 68.0,
+    max_y: float = 180.0,
+) -> str:
+    """Create a smooth closed ribbon path for confidence intervals."""
+    if not top_pts or not bot_pts:
+        return ""
+    top_d = smooth_svg_path(top_pts, min_y=min_y, max_y=max_y)
+    rev_bot = list(reversed(bot_pts))
+    bot_d = smooth_svg_path(rev_bot, min_y=min_y, max_y=max_y)
+    bot_segments = re.sub(r"^M\s+[\d\.]+\s+[\d\.]+\s*", "", bot_d)
+    return f"{top_d} L {rev_bot[0][0]:.1f} {rev_bot[0][1]:.1f} {bot_segments} Z"
 
 
 def render_svg(
@@ -439,9 +419,9 @@ def render_svg(
         4.0,
     ) * 1.12
 
-    # Calibrate Y-axis maximum to clean, readable round numbers
+    # Calibrate Y-axis maximum to clean, readable round numbers (even steps ensure clean integer midpoint ticks)
     def nice_ceiling(val: float) -> float:
-        for step in [10.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 150.0, 200.0]:
+        for step in [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 120.0, 150.0, 200.0]:
             if val <= step:
                 return step
         return math.ceil(val / 50.0) * 50.0
@@ -461,9 +441,8 @@ def render_svg(
     ci_top_pts = [obs_pts[-1]] + [to_xy(n_obs + j, v) for j, v in enumerate(upper_ci)]
     ci_bot_pts = [obs_pts[-1]] + [to_xy(n_obs + j, v) for j, v in enumerate(lower_ci)]
 
-    # Build closed polygon for 95% confidence interval fan
-    ci_poly_coords = [f"{x:.1f},{y:.1f}" for x, y in ci_top_pts + list(reversed(ci_bot_pts))]
-    ci_polygon_points = " ".join(ci_poly_coords)
+    # Build smooth closed ribbon for 95% confidence interval fan
+    ci_path_d = smooth_ci_fan(ci_top_pts, ci_bot_pts, min_y=plot_top, max_y=plot_bottom)
 
     # Build area under observed curve
     obs_path_d = smooth_svg_path(obs_pts, min_y=plot_top, max_y=plot_bottom)
@@ -527,15 +506,13 @@ def render_svg(
         )
 
     # Compute top languages (shortened names to guarantee no horizontal overflow)
-    if not lang_bytes:
-        lang_bytes = {"Python": 60, "TypeScript": 25, "C++": 15}
     total_bytes = max(1, sum(lang_bytes.values()))
     top_langs = sorted(lang_bytes.items(), key=lambda x: x[1], reverse=True)[:4]
     lang_spans = []
     for lname, lsize in top_langs:
         pct = (lsize / total_bytes) * 100.0
         color = LANGUAGE_COLORS.get(lname, "#58a6ff")
-        short_name = LANGUAGE_SHORT_NAMES.get(lname, lname)
+        short_name = LANGUAGE_SHORT_NAMES.get(lname, lname[:12])
         lang_spans.append(
             f'<tspan fill="{color}">●</tspan> <tspan fill="#c9d1d9">{html.escape(short_name)} {pct:.0f}%</tspan>'
         )
@@ -554,6 +531,9 @@ def render_svg(
       <stop offset="0%" stop-color="#58a6ff" stop-opacity="0.30" />
       <stop offset="100%" stop-color="#58a6ff" stop-opacity="0.04" />
     </linearGradient>
+    <clipPath id="langCardClip">
+      <rect x="20" y="210" width="370" height="48" rx="6" />
+    </clipPath>
   </defs>
 
   <!-- Card Background -->
@@ -586,7 +566,7 @@ def render_svg(
   <path d="{obs_path_d}" fill="none" stroke="#3fb950" stroke-width="2.2" />
 
   <!-- 95% Confidence Interval Fan & Forecast Trajectory -->
-  <polygon points="{ci_polygon_points}" fill="url(#ciGrad)" />
+  <path d="{ci_path_d}" fill="url(#ciGrad)" />
   <path d="{fc_path_d}" fill="none" stroke="#58a6ff" stroke-width="2.2" stroke-dasharray="5,4" />
 
   <!-- Nowcast Vertical Horizon Line & Animated Marker -->
@@ -603,7 +583,7 @@ def render_svg(
   <!-- Bottom Telemetry Split Cards (Balanced widths prevent horizontal text clipping) -->
   <rect x="20" y="210" width="370" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
   <text x="32" y="227" fill="#8b949e" font-size="9" font-weight="bold">REPOSITORY LANGUAGE DISTRIBUTION</text>
-  <text x="32" y="246" font-size="11" xml:space="preserve">{lang_summary_svg}</text>
+  <text x="32" y="246" font-size="11" xml:space="preserve" clip-path="url(#langCardClip)">{lang_summary_svg}</text>
 
   <rect x="402" y="210" width="378" height="48" rx="6" fill="#161b22" stroke="#21262d" stroke-width="1" />
   <text x="414" y="227" fill="#8b949e" font-size="9" font-weight="bold">52-WEEK TELEMETRY &amp; MODEL DIAGNOSTICS</text>
@@ -613,24 +593,36 @@ def render_svg(
 
 
 def main() -> None:
+    is_pr = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+
+    def fatal_exit(msg: str) -> None:
+        print(msg)
+        if is_pr:
+            sys.exit(1)
+        sys.exit(0)
+
     metrics_token = os.environ.get("METRICS_TOKEN")
     token = metrics_token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    daily: List[Tuple[str, int]] = []
-    lang_bytes: Dict[str, int] = {}
-    total_contribs = 0
+    if not token:
+        fatal_exit("Error: No GitHub token provided (METRICS_TOKEN / GITHUB_TOKEN / GH_TOKEN missing). Aborting without updating SVG.")
+        return
 
-    if token:
-        try:
-            daily, lang_bytes, total_contribs = fetch_via_graphql(
-                USERNAME, token, use_viewer=bool(metrics_token)
-            )
-            print(f"Fetched live GraphQL telemetry for @{USERNAME} ({len(daily)} days, {total_contribs} total contributions).")
-        except Exception as exc:
-            print(f"GraphQL fetch failed ({exc}), falling back to public endpoints...")
+    try:
+        daily, lang_bytes, total_contribs = fetch_via_graphql(
+            USERNAME, token, use_viewer=bool(metrics_token)
+        )
+        print(f"Fetched live GraphQL telemetry for @{USERNAME} ({len(daily)} days, {total_contribs} total contributions).")
+    except Exception as exc:
+        fatal_exit(f"GraphQL fetch failed ({exc}). Aborting without updating SVG.")
+        return
 
-    if not daily:
-        daily, lang_bytes, total_contribs = fetch_via_public(USERNAME, token=token)
-        print(f"Fetched live public telemetry for @{USERNAME} ({len(daily)} days, {total_contribs} total contributions).")
+    if not daily or total_contribs <= 0:
+        fatal_exit(f"No contribution data retrieved for @{USERNAME}. Aborting without updating SVG.")
+        return
+
+    if not lang_bytes:
+        fatal_exit(f"Language extraction failed or returned no data for @{USERNAME}. Aborting without updating SVG.")
+        return
 
     week_dates, raw_weekly = aggregate_weekly(daily, num_weeks=52)
     latent_signal, forecast_mean, forecast_std, rmse = fit_regularized_dfm_ar(
